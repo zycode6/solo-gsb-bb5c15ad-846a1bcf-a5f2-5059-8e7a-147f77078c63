@@ -10,6 +10,7 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Iterator
 
+from .audit import AUDIT_SCHEMA_SQL, install_audit_triggers
 from .config import settings
 
 _SCHEMA = """
@@ -43,14 +44,15 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     response_body   TEXT NOT NULL,
     created INTEGER NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
-"""
+""" + AUDIT_SCHEMA_SQL
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
     """对已有数据库做幂等升级（旧库没有 containers.version 列）。
 
-    ``idempotency_keys`` 表由建表脚本中的 ``CREATE TABLE IF NOT EXISTS`` 负责补齐，
-    旧库升级时自动创建，无需手工迁移。
+    ``idempotency_keys`` 与审计链相关的表（``audit_records``、
+    ``audit_record_containers``）由建表脚本中的 ``CREATE TABLE IF NOT EXISTS``
+    负责补齐，旧库升级时自动创建，无需手工迁移；只追加审计触发器在此幂等安装。
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(containers)")}
     if columns and "version" not in columns:
@@ -58,6 +60,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE containers ADD COLUMN version INTEGER NOT NULL DEFAULT 0"
         )
+    # 审计表的只追加触发器（BEFORE UPDATE/DELETE -> RAISE），已存在则跳过
+    install_audit_triggers(conn)
 
 
 def connect() -> sqlite3.Connection:

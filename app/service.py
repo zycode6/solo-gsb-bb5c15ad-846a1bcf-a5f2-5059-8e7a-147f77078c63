@@ -22,6 +22,11 @@
   后续请求直接重放首次响应，不再扣减体积、不再递增 version；同键但请求体不同
   返回 409 idempotency_conflict。失败的请求（4xx）不落任何记录，可用同键重试。
   预演接口不写幂等记录；不携带幂等键时行为完全保持兼容。
+* 每个成功提交的批次还会在同一事务内追加一条**只追加审计记录**（见
+  :mod:`app.audit`）：包含批次摘要、逐步扣取明细、受影响容器提交前后版本/体积
+  与提交后来源构成、结果版本，并把前一条记录的哈希纳入当前记录的 entry_hash，
+  形成可校验哈希链。审计记录由数据库触发器禁止 UPDATE/DELETE；失败批次、
+  幂等重放与预演均不产生审计记录。
 """
 from __future__ import annotations
 
@@ -249,17 +254,23 @@ def _simulate_transfers(
     conn: sqlite3.Connection,
     prepared: list[tuple[str, str, Decimal]],
     expected_versions: Mapping[str, int] | None = None,
-) -> tuple[dict[str, State], Versions, list[dict[str, Decimal]]]:
+) -> tuple[
+    dict[str, State], Versions, list[dict[str, Decimal]], dict[str, State]
+]:
     """按数组顺序在内存中依次模拟一批转移（链式转移看到本批前序结果）。
 
     只从数据库读取、在内存状态上演算，**不写库**；返回
-    ``(被触碰容器的最终状态, 被触碰容器的当前 version, 每一步从各祖先来源实际扣取的份额)``。
-    提交与预演共用本函数，校验规则、错误码与条目序号因此完全一致。
+    ``(被触碰容器的最终状态, 被触碰容器的当前 version, 每一步从各祖先来源
+    实际扣取的份额, 被触碰容器在本批之前的初始状态快照)``。
+    第四个返回值是各容器**触碰前**的深拷贝快照，供审计记录记载
+    version_before / volume_before。提交与预演共用本函数，校验规则、错误码
+    与条目序号因此完全一致。
 
     若提供 ``expected_versions``，则在事务内对每个被触碰容器读取到的当前版本做
     乐观并发校验：任一不符即抛 409 stale_container（调用方负责回滚，整批不落库）。
     """
     touched: dict[str, State] = {}
+    pre_states: dict[str, State] = {}
     versions: Versions = {}
     taken_steps: list[dict[str, Decimal]] = []
 
@@ -287,6 +298,10 @@ def _simulate_transfers(
                                 f"当前 version={current_version}，整批拒绝且不落库"
                             ),
                         )
+                # 保留触碰前快照供审计记载 before 值。Decimal 不可变，模拟中对
+                # touched 的原地操作只会整体替换/删除键值，不会原地修改 Decimal，
+                # 故浅拷贝 dict 即可完整隔离快照与模拟状态。
+                pre_states[cid] = dict(state)
                 touched[cid] = state
                 versions[cid] = current_version
 
@@ -322,7 +337,7 @@ def _simulate_transfers(
                 del src_state[sid]
         taken_steps.append(taken)
 
-    return touched, versions, taken_steps
+    return touched, versions, taken_steps, pre_states
 
 
 def build_batch_response(applied: int, versions: Versions) -> dict:
@@ -367,13 +382,15 @@ def _commit_batch(
     """在单个写事务内完成一批转移的全部读写（幂等逻辑亦在此事务内）。
 
     调用前必须已完成与数据库状态无关的参数/覆盖校验。
-    IMMEDIATE 保证“幂等查重 + 状态校验 + 扣减写入 + 幂等记录写入”原子发生：
+    IMMEDIATE 保证“幂等查重 + 状态校验 + 扣减写入 + 幂等记录写入 +
+    审计链追加”原子发生：
 
     * 携带 ``idempotency_key`` 且键已存在：指纹一致 -> 回滚后重放首次响应
-      （不重复扣减、不重复递增 version）；指纹不一致 -> 回滚后抛
-      409 idempotency_conflict；
-    * 键不存在：正常模拟、持久化，并在**同一事务**插入请求指纹与完整响应；
-    * 不携带幂等键：行为与旧版本完全一致。
+      （不重复扣减、不重复递增 version、**不追加审计记录**）；指纹不一致 ->
+      回滚后抛 409 idempotency_conflict；
+    * 键不存在：正常模拟、持久化，在**同一事务**插入请求指纹与完整响应，
+      并追加一条含 prev_hash 的只追加审计记录（见 :mod:`app.audit`）；
+    * 不携带幂等键：其余行为与旧版本完全一致，审计记录同样写入。
     """
     # IMMEDIATE：拿到写锁后再读版本与状态，保证“校验+写入”在同一写事务内原子
     conn.execute("BEGIN IMMEDIATE")
@@ -405,11 +422,27 @@ def _commit_batch(
                     payload=payload,
                 )
 
-        touched, current_versions, _taken = _simulate_transfers(
+        touched, current_versions, taken_steps, pre_states = _simulate_transfers(
             conn, prepared, expected_versions
         )
         next_versions = {cid: ver + 1 for cid, ver in current_versions.items()}
         _persist_states(conn, touched, next_versions)
+
+        # 审计记录与容器扣减、version 递增、幂等行写入同一事务：
+        # 之后任何异常都会连同审计行一起回滚，失败 / 预演绝不留痕。
+        # 延迟导入避免 service <-> audit 导入环（audit 依赖本模块的 LineageError）。
+        from . import audit
+
+        audit.append_batch_audit(
+            conn,
+            prepared=prepared,
+            taken_steps=taken_steps,
+            touched=touched,
+            pre_states=pre_states,
+            prev_versions=current_versions,
+            next_versions=next_versions,
+            idempotency_key=idempotency_key,
+        )
 
         payload = build_batch_response(len(prepared), next_versions)
         if idempotency_key is not None:
@@ -504,12 +537,12 @@ def preview_transfers(
 
     conn.execute("BEGIN")
     try:
-        touched, current_versions, taken_steps = _simulate_transfers(
+        touched, current_versions, taken_steps, _pre_states = _simulate_transfers(
             conn, prepared, expected_versions
         )
         predicted_versions = {cid: ver + 1 for cid, ver in current_versions.items()}
     finally:
-        # 预演只读不落库：无论成功失败都回滚，数据库状态必然不变
+        # 预演只读不落库：无论成功失败都回滚，数据库状态必然不变（也不写审计）
         conn.execute("ROLLBACK")
 
     steps: list[dict] = []

@@ -166,3 +166,82 @@ class BatchPreviewOut(BaseModel):
     containers: list[ContainerStatusOut] = Field(
         ..., description="全部受影响容器在预演结束时的最终体积与来源构成"
     )
+
+
+# --------------------------------------------------------------------------- #
+# 审计链（app/audit.py）
+# --------------------------------------------------------------------------- #
+class AuditSummaryOut(BaseModel):
+    transfer_count: int = Field(..., description="本批转移条数")
+    total_volume: DecimalStr = Field(..., description="本批转移体积之和（提交后汇总）")
+    containers: list[str] = Field(..., description="受影响容器 ID（去重，按 ID 排序）")
+    idempotency_key: str | None = Field(..., description="本批携带的幂等键，未携带为 null")
+
+
+class AuditContainerOut(BaseModel):
+    container_id: str
+    version_before: int = Field(..., description="该容器在本批之前的 version")
+    version_after: int = Field(..., description="提交后的 version（恰好 +1）")
+    volume_before: DecimalStr = Field(..., description="该容器在本批之前的体积")
+    volume_after: DecimalStr = Field(..., description="提交后的体积")
+    sources_after: list[TakenOut] = Field(
+        ..., description="提交后该容器各祖先来源的绝对体积份额"
+    )
+
+
+class AuditRecordOut(BaseModel):
+    seq: int = Field(..., description="链上序号，从 1 开始连续递增")
+    prev_hash: str = Field(..., description="前一条记录的 entry_hash；首条为 sha256(\"\")")
+    entry_hash: str = Field(
+        ..., description="SHA-256(prev_hash + seq + 规范化载荷)，见 /audit/verify"
+    )
+    created: str | None = Field(..., description="记录创建时间（UTC，ISO-8601）")
+    summary: AuditSummaryOut
+    transfers: list[TransferStepOut]
+    containers: list[AuditContainerOut]
+    result_versions: dict[str, int] = Field(
+        ..., description="提交后各受影响容器的 version（与批量响应 versions 一致）"
+    )
+
+
+class AuditFiltersOut(BaseModel):
+    container_id: str | None
+    start_seq: int | None
+    end_seq: int | None
+
+
+class AuditListOut(BaseModel):
+    count: int
+    limit: int
+    filters: AuditFiltersOut
+    records: list[AuditRecordOut]
+
+
+class AuditCheckOut(BaseModel):
+    ok: bool
+    detail: str | None
+
+
+class AuditBreakInfo(BaseModel):
+    seq: int = Field(..., description="断裂所在（或起首）的记录序号")
+    reason: str = Field(..., description="断裂原因代码")
+    detail: str = Field(..., description="断裂的人类可读说明")
+
+
+class AuditVerifyOut(BaseModel):
+    valid: bool = Field(..., description="整条审计链是否完整可校验")
+    records: int = Field(..., description="审计记录总数")
+    first_seq: int | None
+    max_seq: int | None
+    # break 是 Python 关键字：字段名用 break_，JSON 中仍输出为 "break"
+    break_: AuditBreakInfo | None = Field(default=None, alias="break")
+    checks: dict[str, AuditCheckOut] = Field(
+        ...,
+        description=(
+            "四项检查结果：sequence（序号连续）、hash_chain（prev_hash 链接与"
+            " entry_hash 重算）、payload_integrity（规范化载荷一致）、"
+            "container_index（受影响容器反查索引一致）"
+        ),
+    )
+
+    model_config = {"populate_by_name": True}

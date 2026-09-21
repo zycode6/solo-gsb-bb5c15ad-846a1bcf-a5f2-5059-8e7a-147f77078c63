@@ -8,9 +8,11 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import service
+from . import audit, service
 from .db import get_db, init_db
 from .schemas import (
+    AuditListOut,
+    AuditVerifyOut,
     BatchPreviewOut,
     BatchTransferIn,
     BatchTransferOut,
@@ -37,8 +39,11 @@ app = FastAPI(
         "支持 /transfers/preview 预演：与真实提交同一套校验与分摊，但不落库。"
         "/transfers/batch 支持可选 idempotency_key：成功请求的指纹与完整响应"
         "随转移同一事务持久化，同键同请求体重放、同键异请求体返回 409。"
+        "每个成功批次在同一事务追加一条只追加审计记录（含批次摘要、受影响容器、"
+        "结果版本），以前一条记录的哈希形成可校验哈希链；"
+        "失败 / 重放 / 预演均不产生审计记录。"
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -158,3 +163,39 @@ def container_status(
     container_id: str, conn: sqlite3.Connection = Depends(get_db)
 ) -> dict:
     return service.get_container_status(conn, container_id)
+
+
+# --------------------------------------------------------------------------- #
+# 审计链查询与校验
+# --------------------------------------------------------------------------- #
+@app.get(
+    "/audit/verify",
+    response_model=AuditVerifyOut,
+    tags=["audit"],
+    summary="校验整条审计链的完整性（序号、哈希链、载荷、容器索引）",
+)
+def verify_audit_chain(conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    # 链本身是否有效属于正常查询结果，始终返回 200，结果在 valid / break 中
+    return audit.verify_audit_chain(conn)
+
+
+@app.get(
+    "/audit/records",
+    response_model=AuditListOut,
+    tags=["audit"],
+    summary="按容器与序号范围查询审计记录（按 seq 升序）",
+)
+def list_audit_records(
+    container_id: str | None = None,
+    start_seq: int | None = None,
+    end_seq: int | None = None,
+    limit: int = audit.DEFAULT_LIMIT,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    return audit.get_audit_records(
+        conn,
+        container_id=container_id.strip() if container_id else None,
+        start_seq=start_seq,
+        end_seq=end_seq,
+        limit=limit,
+    )

@@ -18,6 +18,12 @@
   请求体指纹与完整响应与转移**写入同一 SQLite 事务**；同键同请求体重放首次结果
   （不重复扣减体积、不重复递增 `version`），同键但请求体不同返回
   `409 idempotency_conflict`。预演接口不写幂等记录；不携带键时行为与旧版本完全一致。
+- **只追加审计链**：每个**成功提交**的批次在同一事务内追加一条审计记录，包含
+  批次摘要（条数、转移总量、受影响容器、幂等键）、逐步扣取明细、每个受影响容器
+  提交前后的版本/体积与提交后来源构成、以及结果版本；记录的哈希把**前一条记录的
+  摘要**纳入计算，形成可逐条校验的哈希链。审计表由数据库触发器禁止
+  UPDATE/DELETE；失败批次、幂等重放与预演**绝不产生记录**。提供按容器、按序号
+  范围查询审计记录与一键校验整条链完整性的 API。
 - 可查询任一容器的**当前体积**以及各祖先初始样品的**来源占比**。
 
 ---
@@ -54,7 +60,13 @@ SQLite 数据保存在 Docker 命名卷 `lineage-data`（容器内 `/data`）中
 - 旧库缺少幂等表时自动创建 `idempotency_keys`
   （`idempotency_key` 主键、`request_sha256` 请求体指纹、`status_code`、
   `response_body` 完整响应、`created`），历史数据不受影响，旧客户端不带键
-  请求的行为也完全不变。
+  请求的行为也完全不变；
+- 旧库缺少审计表时自动创建 `audit_records`（`seq` 序号、`prev_hash`、
+  `entry_hash`、`payload_json` 规范化载荷、`created`）与反查索引
+  `audit_record_containers`，并幂等安装 4 个**只追加触发器**（两表各一个
+  `BEFORE UPDATE` / `BEFORE DELETE`，命中即 `RAISE`）。升级前的历史批次没有
+  审计记录，审计链从升级后**第一个成功批次**开始，首条 `seq=1`、`prev_hash`
+  为 `sha256("")`。
 
 升级步骤（保留数据）：
 
@@ -73,7 +85,8 @@ c = connect()
 print([r[0] for r in c.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")])
 print([r[1] for r in c.execute('PRAGMA table_info(containers)')])
 "
-# 应包含 idempotency_keys 表，containers 列中应包含 version
+# 应包含 idempotency_keys、audit_records、audit_record_containers 表，
+# containers 列中应包含 version；另应存在 4 个 audit_* 触发器
 ```
 
 停止与清理：
@@ -112,6 +125,11 @@ docker compose down -v       # 同时删除数据卷
   写入一行，记录幂等键、原始请求体的 SHA-256 指纹、首次响应的 HTTP 状态码与完整响应体；
   该行与容器扣减、`version` 递增在**同一个 SQLite 事务**内落库。预演接口不写此表，
   失败的批次（4xx，包括业务错误、`stale_container`、`idempotency_conflict`）也不写。
+- 表 **`audit_records`** + **`audit_record_containers`** 是只追加审计链（详见下文
+  “审计链”一节）：每个成功批次在转移写入的同一事务内追加一行；序号 `seq` 从 1
+  连续递增，`prev_hash` 指向前一条记录、首条为 `sha256("")`，`entry_hash` 覆盖
+  前一条哈希、序号与规范化载荷。两表均有 `BEFORE UPDATE` / `BEFORE DELETE`
+  触发器，任何应用连接都无法修改或删除既有审计行；失败批次、幂等重放、预演不写。
 
 ---
 
@@ -252,6 +270,11 @@ curl -X POST http://localhost:8000/transfers/batch \
 {"error":{"code":"insufficient_volume","message":"第 2 条转移源液不足：'V1' 当前 75.000000000，请求 9999.000000000，整批拒绝"}}
 ```
 
+审计查询接口（`GET /audit/records`）的参数错误使用同一错误响应结构：
+未知容器 `404 unknown_container`、序号范围非法（`<1` 或 `end<start`）
+`422 invalid_seq_range`、`limit` 越界 `422 invalid_limit`；
+`GET /audit/verify` 不返回错误码——链是否完好始终是 200 响应中的 `valid` 字段。
+
 ### 4. 预演批量转移（不落库）
 
 `POST /transfers/preview` 使用与批量提交**完全相同的请求结构**（同样接受可选的
@@ -349,6 +372,158 @@ curl http://localhost:8000/containers/V1
 
 ---
 
+## 审计链（只追加 + 哈希链）
+
+每个**成功提交**的批次（无论是否携带 `idempotency_key` / `expected_versions`）都会在
+容器扣减、`version` 递增、幂等行所在的**同一个 SQLite 事务**内追加一条审计记录，
+因此审计记录与业务状态要么同时可见、要么一起回滚：
+
+- **失败不留痕**：任何 4xx（参数错误、源液不足、未知容器、自转移、`stale_container`、
+  `idempotency_conflict` 等）整批回滚，审计行一起回滚；
+- **预演不留痕**：`/transfers/preview` 只读，成功失败都不写审计；
+- **幂等重放不留痕**：同键同请求体重放直接返回首次响应，不执行转移也不追加审计记录。
+
+### 记录内容
+
+每条记录（`audit_records` 一行 + `audit_record_containers` 每个受影响容器一行）含：
+
+| 字段 | 说明 |
+| --- | --- |
+| `seq` | 链上序号，从 `1` 开始连续递增、无空洞（由写事务内 `max(seq)+1` 分配） |
+| `prev_hash` | 前一条记录的 `entry_hash`；首条为 **`sha256("")`**（空字符串的 SHA-256，即 `e3b0c4…b855`） |
+| `entry_hash` | `SHA-256(prev_hash + "\n" + seq + "\n" + 规范化载荷)` 的小写 hex |
+| `created` | 追加时间（UTC，`strftime('%Y-%m-%dT%H:%M:%fZ','now')`） |
+| `summary` | 批次摘要：`transfer_count`、`total_volume`（全部转移体积之和）、`containers`（受影响容器，去重排序）、`idempotency_key`（未携带为 `null`） |
+| `transfers` | 逐步明细：`index` / `source` / `destination` / `volume` 与 `taken`（该步按最大余额法从各祖先来源实际扣取的精确份额） |
+| `containers` | 每个受影响容器的 `version_before` / `version_after`（恰好 +1）、`volume_before` / `volume_after`、`sources_after`（提交后各祖先来源绝对份额） |
+| `result_versions` | 提交后各受影响容器版本，与批量响应 `versions` 一致 |
+
+“规范化载荷”指 `json.dumps(payload, sort_keys=True, separators=(",",":"), ensure_ascii=False)`
+的输出；库中 `payload_json` 与哈希输入逐字节相同。键排序保证同一语义只有一种字节表示，
+因此任何对载荷的改动（包括重新格式化）都会导致哈希校验失败。
+
+**只追加**由数据库层强制：`audit_records` 与 `audit_record_containers` 各有一对
+`BEFORE UPDATE` / `BEFORE DELETE` 触发器，任何 UPDATE/DELETE 都会得到
+`sqlite3.DatabaseError: ... 只追加 ...`（在触发器内 `RAISE(FAIL, ...)`）。应用只做
+INSERT，不提供修改/删除审计记录的 API。
+
+> 安全模型说明：触发器防止通过本应用 / 普通数据库连接的意外修改，并能让
+> `/audit/verify` 检出**外部直接改库文件**（绕过触发器）的篡改。但拥有库文件写权限、
+> 又能 DROP TRIGGER 的攻击者仍可重写整条链——哈希链提供的是**篡改可检测性**，不是
+> 防写保护；需要更强保证时可定期把 `GET /audit/verify` 与最后一条 `entry_hash`
+> 存放到带外（如离线 WORM / 另一台主机）。
+
+### 6. 查询审计记录：按容器与序号范围
+
+```bash
+# 全部记录（按 seq 升序，默认 limit=100，最大 1000）
+curl 'http://localhost:8000/audit/records'
+
+# 仅查容器 V1 作为源 / 目标出现过的批次（JOIN audit_record_containers）
+curl 'http://localhost:8000/audit/records?container_id=V1'
+
+# 序号闭区间（含端点），可与 container_id、limit 任意组合
+curl 'http://localhost:8000/audit/records?start_seq=2&end_seq=10&limit=20'
+```
+
+查询参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `container_id` | 可选。只返回该容器作为源 / 目标出现过的批次；容器不存在返回 `404 unknown_container`；容器存在但从未参与批次返回空列表 |
+| `start_seq` / `end_seq` | 可选，闭区间，必须 ≥ 1 且 `end_seq ≥ start_seq`，否则 `422 invalid_seq_range` |
+| `limit` | 可选，默认 `100`、范围 `1..1000`，越界返回 `422 invalid_limit`；超出部分用 `start_seq=上页末序号+1` 翻页 |
+
+响应：
+
+```json
+{
+  "count": 1,
+  "limit": 100,
+  "filters": {"container_id": null, "start_seq": null, "end_seq": null},
+  "records": [
+    {
+      "seq": 1,
+      "prev_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "entry_hash": "6b292c…",
+      "created": "2026-09-21T12:00:00.000Z",
+      "summary": {
+        "transfer_count": 2,
+        "total_volume": "100.000000000",
+        "containers": ["S1", "S2", "V1"],
+        "idempotency_key": null
+      },
+      "transfers": [
+        {"index": 1, "source": "S1", "destination": "V1", "volume": "40.000000000",
+         "taken": [{"source_id": "S1", "amount": "40.000000000"}]},
+        {"index": 2, "source": "S2", "destination": "V1", "volume": "60.000000000",
+         "taken": [{"source_id": "S2", "amount": "60.000000000"}]}
+      ],
+      "containers": [
+        {"container_id": "S1", "version_before": 0, "version_after": 1,
+         "volume_before": "100.000000000", "volume_after": "60.000000000",
+         "sources_after": [{"source_id": "S1", "amount": "60.000000000"}]},
+        {"container_id": "S2", "version_before": 0, "version_after": 1,
+         "volume_before": "100.000000000", "volume_after": "40.000000000",
+         "sources_after": [{"source_id": "S2", "amount": "40.000000000"}]},
+        {"container_id": "V1", "version_before": 0, "version_after": 1,
+         "volume_before": "0", "volume_after": "100.000000000",
+         "sources_after": [
+           {"source_id": "S1", "amount": "40.000000000"},
+           {"source_id": "S2", "amount": "60.000000000"}]}
+      ],
+      "result_versions": {"S1": 1, "S2": 1, "V1": 1}
+    }
+  ]
+}
+```
+
+### 7. 校验整条审计链
+
+```bash
+curl http://localhost:8000/audit/verify
+```
+
+无论链是否完好都返回 **200**（校验是正常查询，链损坏不是服务错误），结果在
+`valid` 字段：
+
+```json
+{
+  "valid": true,
+  "records": 3,
+  "first_seq": 1,
+  "max_seq": 3,
+  "break": null,
+  "checks": {
+    "sequence":          {"ok": true, "detail": null},
+    "hash_chain":        {"ok": true, "detail": null},
+    "payload_integrity": {"ok": true, "detail": null},
+    "container_index":   {"ok": true, "detail": null}
+  }
+}
+```
+
+四项检查：
+
+1. **`sequence`**：所有行序号必须恰好是 `1..N`（从 1 开始、连续、无重复）——
+   能发现中间删除 / 插入记录；
+2. **`hash_chain`**：每行 `prev_hash` 必须等于前一行 `entry_hash`
+   （首行等于 `sha256("")`），且用存储载荷重算的哈希必须等于 `entry_hash`——
+   能发现载荷篡改、哈希篡改、记录替换；
+3. **`payload_integrity`**：存储载荷重新规范化后必须与 `payload_json` 逐字节一致，
+   且载荷内 `seq` 与行序号一致——能发现被改写但未重算哈希的载荷；
+4. **`container_index`**：载荷中的受影响容器必须与反查索引表
+   `audit_record_containers`（按 `position` 排序）完全一致。
+
+任一项失败时 `valid=false`，`break` 按
+`sequence → hash_chain → payload_integrity → container_index` 的优先级给出
+第一处断裂：`{"seq": <序号>, "reason": <原因码>, "detail": <说明>}`。
+即使攻击者篡改载荷后**重算**了该行自身的 `entry_hash`，下一行的 `prev_hash`
+链接仍会断裂并被检出（除非整条链从断点起全部重写）。空链（没有任何成功批次）
+视为有效：`records=0, valid=true`。
+
+---
+
 ## 精确性说明
 
 转移量在各祖先来源之间的分摊采用**最大余额法**（Hare quota + Largest remainder）：
@@ -385,11 +560,12 @@ pytest -q
 ```
 app/
   config.py     # 环境变量配置
-  db.py         # SQLite 连接、建库（启动时执行）
+  db.py         # SQLite 连接、建库（启动时执行，含审计表与只追加触发器迁移）
   schemas.py    # Pydantic 请求/响应模型（Decimal <-> 字符串）
   service.py    # 核心逻辑：登记、批量转移事务、比例分摊、查询
-  main.py       # FastAPI 路由与错误处理
-tests/          # pytest 端到端与分摊算法测试
+  audit.py      # 只追加审计链：载荷规范化、哈希、同事务追加、查询、链校验
+  main.py       # FastAPI 路由与错误处理（含 /audit/records、/audit/verify）
+tests/          # pytest 端到端、分摊算法、幂等与审计链测试
 Dockerfile
 docker-compose.yml
 docker-entrypoint.sh

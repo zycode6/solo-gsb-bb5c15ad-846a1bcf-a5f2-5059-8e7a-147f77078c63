@@ -11,7 +11,7 @@ os.environ.setdefault("PROPORTION_SCALE", "6")
 import pytest
 from fastapi.testclient import TestClient
 
-from app import service
+from app import audit, service
 from app.db import connect, init_db
 from app.main import app
 from decimal import Decimal
@@ -27,6 +27,8 @@ def _init():
 def _clean_tables():
     conn = connect()
     try:
+        # 审计表有只追加触发器（禁止 DELETE），需先临时摘除触发器再清空
+        audit.reset_for_tests(conn)
         conn.execute("DELETE FROM components")
         conn.execute("DELETE FROM containers")
         conn.execute("DELETE FROM idempotency_keys")
