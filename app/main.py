@@ -5,12 +5,15 @@ import json
 import sqlite3
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Request, Response
+from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import service
+from . import audit, service
 from .db import get_db, init_db
 from .schemas import (
+    AuditRecordListOut,
+    AuditRecordOut,
+    AuditVerificationOut,
     BatchPreviewOut,
     BatchTransferIn,
     BatchTransferOut,
@@ -37,14 +40,26 @@ app = FastAPI(
         "支持 /transfers/preview 预演：与真实提交同一套校验与分摊，但不落库。"
         "/transfers/batch 支持可选 idempotency_key：成功请求的指纹与完整响应"
         "随转移同一事务持久化，同键同请求体重放、同键异请求体返回 409。"
+        "每个成功批次还在同一事务追加一条只追加审计记录（批次摘要、受影响容器、"
+        "结果版本），record_hash 纳入上一条记录哈希形成 SHA-256 哈希链；"
+        "可按容器与序号范围查询（/audit/records）并校验整条链（/audit/verify）。"
+        "失败批次、幂等重放与 /transfers/preview 预演均不产生审计记录。"
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
 
 @app.exception_handler(service.LineageError)
 async def lineage_error_handler(request: Request, exc: service.LineageError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"code": exc.code, "message": exc.message}},
+    )
+
+
+@app.exception_handler(audit.AuditError)
+async def audit_error_handler(request: Request, exc: audit.AuditError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": {"code": exc.code, "message": exc.message}},
@@ -158,3 +173,55 @@ def container_status(
     container_id: str, conn: sqlite3.Connection = Depends(get_db)
 ) -> dict:
     return service.get_container_status(conn, container_id)
+
+
+# --------------------------------------------------------------------------- #
+# 审计哈希链
+# --------------------------------------------------------------------------- #
+@app.get(
+    "/audit/records/{seq}",
+    response_model=AuditRecordOut,
+    tags=["audit"],
+    summary="按序号查询单条批次审计记录",
+)
+def get_audit_record(
+    seq: int, conn: sqlite3.Connection = Depends(get_db)
+) -> dict:
+    return audit.get_audit_record(conn, seq)
+
+
+@app.get(
+    "/audit/records",
+    response_model=AuditRecordListOut,
+    tags=["audit"],
+    summary="按容器和/或序号范围查询只追加审计记录（按 seq 升序）",
+)
+def list_audit_records(
+    container_id: str | None = Query(
+        default=None,
+        description=(
+            "可选：仅返回该容器出现在“受影响容器”中的批次记录；"
+            "容器不存在返回 404 unknown_container"
+        ),
+    ),
+    seq_from: int | None = Query(
+        default=None, ge=1, description="可选：序号闭区间下界（含），从 1 开始"
+    ),
+    seq_to: int | None = Query(
+        default=None, ge=1, description="可选：序号闭区间上界（含）"
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    return audit.list_audit_records(conn, container_id, seq_from, seq_to)
+
+
+@app.get(
+    "/audit/verify",
+    response_model=AuditVerificationOut,
+    tags=["audit"],
+    summary="校验整条审计哈希链的完整性",
+)
+def verify_audit_chain(conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    """顺序重放全链：序号连续、逐记录重算 SHA-256、比对 prev_hash 链节、
+    交叉核对受影响容器索引。任何删改都导致 valid=false 并给出首个断裂位置。"""
+    return audit.verify_chain(conn)

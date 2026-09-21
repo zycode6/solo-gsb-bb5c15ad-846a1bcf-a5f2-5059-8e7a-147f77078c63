@@ -166,3 +166,75 @@ class BatchPreviewOut(BaseModel):
     containers: list[ContainerStatusOut] = Field(
         ..., description="全部受影响容器在预演结束时的最终体积与来源构成"
     )
+
+
+# --------------------------------------------------------------------------- #
+# 审计哈希链
+# --------------------------------------------------------------------------- #
+class AuditTakenOut(BaseModel):
+    source_id: str = Field(..., description="祖先初始样品 ID")
+    amount: str = Field(..., description="本步从该祖先来源实际扣取的精确体积")
+
+
+class AuditStepOut(BaseModel):
+    index: int = Field(..., description="转移在批次数组中的序号（从 1 开始）")
+    source: str
+    destination: str
+    volume: str = Field(..., description="本步转移体积（规范化后）")
+    taken: list[AuditTakenOut] = Field(
+        ..., description="本步从各祖先来源实际扣取的精确份额（之和等于 volume）"
+    )
+
+
+class AuditSummaryOut(BaseModel):
+    transfer_count: int = Field(..., description="本批转移条数")
+    steps: list[AuditStepOut] = Field(..., description="逐步转移与扣取明细")
+
+
+class AuditRecordOut(BaseModel):
+    seq: int = Field(..., description="链上序号，从 1 开始连续递增")
+    prev_hash: str = Field(
+        ..., description="上一条记录的 record_hash；首条为 64 个 0（创世）"
+    )
+    record_hash: str = Field(
+        ...,
+        description=(
+            "本条记录哈希：SHA-256(规范化 JSON，含 seq/prev_hash/summary/"
+            "affected_containers/versions) 的小写 hex"
+        ),
+    )
+    transfer_count: int
+    summary: AuditSummaryOut = Field(..., description="批次摘要")
+    affected_containers: list[str] = Field(
+        ..., description="受影响容器（本批全部源/目标去重，按 ID 排序）"
+    )
+    versions: dict[str, int] = Field(
+        ..., description="提交后各受影响容器的乐观版本（结果版本）"
+    )
+    created: str | None = Field(
+        ..., description="落库时间（UTC ISO-8601，由数据库生成，不参与哈希）"
+    )
+
+
+class AuditRecordListOut(BaseModel):
+    container_id: str | None = Field(
+        ..., description="按容器过滤时的容器 ID；未按容器过滤为 null"
+    )
+    seq_from: int | None = Field(..., description="序号闭区间下界；未给为 null")
+    seq_to: int | None = Field(..., description="序号闭区间上界；未给为 null")
+    count: int = Field(..., description="本次返回的记录条数")
+    records: list[AuditRecordOut] = Field(..., description="按 seq 升序的审计记录")
+
+
+class AuditVerificationOut(BaseModel):
+    valid: bool = Field(..., description="整条链是否完整、自洽")
+    count: int = Field(..., description="链上记录总数")
+    head_seq: int | None = Field(..., description="首条记录序号（空链为 null）")
+    tail_seq: int | None = Field(..., description="末条记录序号（空链为 null）")
+    tail_hash: str | None = Field(
+        ..., description="末条记录哈希（链有效时给出，可作为链头锚点；空链为 null）"
+    )
+    break_at: int | None = Field(
+        ..., description="首个断裂记录的序号；valid=true 时为 null"
+    )
+    reason: str | None = Field(..., description="断裂原因；valid=true 时为 null")

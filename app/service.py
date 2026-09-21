@@ -22,6 +22,10 @@
   后续请求直接重放首次响应，不再扣减体积、不再递增 version；同键但请求体不同
   返回 409 idempotency_conflict。失败的请求（4xx）不落任何记录，可用同键重试。
   预演接口不写幂等记录；不携带幂等键时行为完全保持兼容。
+* 每个**成功**批次还会在同一写事务内向只追加审计链（见 :mod:`app.audit`）
+  追加一条记录：批次摘要（逐步转移与按混合比例实际扣取的祖先来源份额）、
+  受影响容器与提交后版本；记录哈希纳入上一条记录哈希，形成可整体校验的
+  SHA-256 哈希链。失败批次、幂等重放与预演均不产生审计记录。
 """
 from __future__ import annotations
 
@@ -32,6 +36,7 @@ from collections.abc import Iterable, Mapping
 from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal, localcontext
 from typing import NamedTuple
 
+from . import audit
 from .config import VOLUME_QUANTUM, settings
 
 # 组成：source_id（祖先初始样品）-> 绝对体积份额
@@ -405,11 +410,16 @@ def _commit_batch(
                     payload=payload,
                 )
 
-        touched, current_versions, _taken = _simulate_transfers(
+        touched, current_versions, taken_steps = _simulate_transfers(
             conn, prepared, expected_versions
         )
         next_versions = {cid: ver + 1 for cid, ver in current_versions.items()}
         _persist_states(conn, touched, next_versions)
+
+        # 审计只追加记录与容器扣减/版本递增在同一事务：批次失败时整体回滚，
+        # 不留审计记录。幂等重放走上方早返回分支，不会执行到这里，
+        # 因此重放（不重复转移）也不会追加第二条审计记录。
+        audit.append_batch_audit(conn, prepared, taken_steps, next_versions)
 
         payload = build_batch_response(len(prepared), next_versions)
         if idempotency_key is not None:

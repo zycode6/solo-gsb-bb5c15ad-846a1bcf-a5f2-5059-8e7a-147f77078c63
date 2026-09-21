@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import service
-from app.db import connect, init_db
+from app.db import connect, init_db, reset_audit_tables
 from app.main import app
 from decimal import Decimal
 
@@ -30,6 +30,8 @@ def _clean_tables():
         conn.execute("DELETE FROM components")
         conn.execute("DELETE FROM containers")
         conn.execute("DELETE FROM idempotency_keys")
+        # 审计表受只追加触发器保护，需先摘触发器再清空（测试辅助）
+        reset_audit_tables(conn)
         yield
     finally:
         conn.close()

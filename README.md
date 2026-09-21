@@ -18,6 +18,12 @@
   请求体指纹与完整响应与转移**写入同一 SQLite 事务**；同键同请求体重放首次结果
   （不重复扣减体积、不重复递增 `version`），同键但请求体不同返回
   `409 idempotency_conflict`。预演接口不写幂等记录；不携带键时行为与旧版本完全一致。
+- **只追加审计哈希链**：每个**成功**批次在同一事务追加一条审计记录，内容包含
+  **批次摘要**（逐步转移及按混合比例实际扣取的祖先来源精确份额）、**受影响容器**
+  与提交后的**结果版本**；每条记录的 SHA-256 哈希纳入上一条记录的哈希（首条引用
+  全 0 的创世哈希），形成可整体校验的链。存储层触发器拒绝任何 UPDATE/DELETE；
+  可按容器与序号范围查询记录（`GET /audit/records`）、取单条（`GET /audit/records/{seq}`）
+  并校验整条链（`GET /audit/verify`）。**失败批次、幂等重放与预演均不产生记录。**
 - 可查询任一容器的**当前体积**以及各祖先初始样品的**来源占比**。
 
 ---
@@ -54,7 +60,11 @@ SQLite 数据保存在 Docker 命名卷 `lineage-data`（容器内 `/data`）中
 - 旧库缺少幂等表时自动创建 `idempotency_keys`
   （`idempotency_key` 主键、`request_sha256` 请求体指纹、`status_code`、
   `response_body` 完整响应、`created`），历史数据不受影响，旧客户端不带键
-  请求的行为也完全不变。
+  请求的行为也完全不变；
+- 旧库缺少审计表时自动创建 **`audit_records`**（哈希链）与 **`audit_containers`**
+  （批次→受影响容器索引）并安装四个**只追加触发器**（禁止两表的 UPDATE/DELETE）。
+  升级前发生的历史批次没有审计记录，链从升级后**第一个成功批次**开始计数
+  （该条即 `seq=1`、引用全 0 创世哈希），无需补录。
 
 升级步骤（保留数据）：
 
@@ -112,6 +122,9 @@ docker compose down -v       # 同时删除数据卷
   写入一行，记录幂等键、原始请求体的 SHA-256 指纹、首次响应的 HTTP 状态码与完整响应体；
   该行与容器扣减、`version` 递增在**同一个 SQLite 事务**内落库。预演接口不写此表，
   失败的批次（4xx，包括业务错误、`stale_container`、`idempotency_conflict`）也不写。
+- 表 **`audit_records`** 是只追加的批次审计哈希链，**`audit_containers`** 是其按容器
+  查询的索引表，两表均由触发器禁止 UPDATE/DELETE。审计记录的字段、哈希规则与
+  校验方式见下文“批次审计哈希链”一节。
 
 ---
 
@@ -347,6 +360,132 @@ curl http://localhost:8000/containers/V1
 - `proportion`：占容器当前体积的比例，按 `PROPORTION_SCALE` 四舍五入，仅用于展示。
 - 空容器返回 `"version":0`、`"volume":"0"`、`"sources":[]`；未知容器返回 `404 unknown_container`。
 
+### 6. 批次审计哈希链（只追加、可校验）
+
+每个**成功**提交的批量转移，都会与容器扣减、版本递增在**同一个 SQLite 事务**内
+追加一条审计记录；该事务回滚（失败批次）时记录随之消失，因此：
+
+- 只有真实成功的批次产生记录；**失败（任何 4xx）不产生记录**；
+- `/transfers/preview` 预演**只读**，成功或失败都**不产生记录**（携带幂等键也忽略）；
+- 幂等提交的**重放**请求不重新执行转移，**不追加**第二条记录（每个成功批次恰一条）；
+- 不携带幂等键的普通提交同样写审计记录。
+
+一条审计记录包含：
+
+| 字段 | 含义 |
+| --- | --- |
+| `seq` | 链上序号，**从 1 开始连续递增**（`BEGIN IMMEDIATE` 写锁保证不重号） |
+| `prev_hash` | 上一条记录的 `record_hash`；`seq=1` 为 64 个 `0`（创世哈希） |
+| `record_hash` | 本条记录内容的 SHA-256 小写 hex（算法见下） |
+| `summary` | **批次摘要**：`transfer_count` 与逐步明细 `steps`（序号、源、目标、规范化体积，以及按源容器当时混合比例从各祖先来源**实际扣取的精确份额** `taken`） |
+| `affected_containers` | **受影响容器**：本批全部源/目标去重后按 ID 排序 |
+| `versions` | **结果版本**：提交后每个受影响容器的乐观版本（与批量响应中的 `versions` 一致） |
+| `created` | 落库时间（UTC ISO-8601，由数据库生成，**不参与哈希**） |
+
+哈希算法：`record_hash = SHA-256( 规范化 JSON( {seq, prev_hash, summary,
+affected_containers, versions} ) )`，规范化指 `sort_keys=True`、紧凑分隔符
+`(",", ":")`、不转义非 ASCII 的 UTF-8 JSON（与库中 `payload` 列逐字节一致）。
+因此任何对历史记录内容的篡改都会让重算哈希与存储值不符；删除/重排记录则会破坏
+序号连续性或后继记录的 `prev_hash`。存储层另有四个 SQLite 触发器
+（`trg_audit_records_no_update/no_delete`、`trg_audit_containers_no_update/no_delete`）
+拒绝一切通过 SQL 的 UPDATE/DELETE——只追加是存储层强制的，而非仅靠应用约定。
+
+#### 6.1 按序号取单条记录
+
+```bash
+curl http://localhost:8000/audit/records/1
+```
+
+```json
+{
+  "seq": 1,
+  "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "record_hash": "23729d1c…e8078",
+  "transfer_count": 2,
+  "summary": {
+    "transfer_count": 2,
+    "steps": [
+      {"index": 1, "source": "S1", "destination": "V1", "volume": "40.000000000",
+       "taken": [{"source_id": "S1", "amount": "40.000000000"}]},
+      {"index": 2, "source": "S2", "destination": "V1", "volume": "60.000000000",
+       "taken": [{"source_id": "S2", "amount": "60.000000000"}]}
+    ]
+  },
+  "affected_containers": ["S1", "S2", "V1"],
+  "versions": {"S1": 1, "S2": 1, "V1": 1},
+  "created": "2026-09-21T08:30:12.123Z"
+}
+```
+
+序号不存在返回 `404 audit_record_not_found`。
+
+#### 6.2 按容器和/或序号范围查询
+
+`GET /audit/records` 的查询参数（均可选，可任意组合）：
+
+| 参数 | 说明 |
+| --- | --- |
+| `container_id` | 仅返回该容器出现在受影响容器集合中的批次；容器不存在返回 `404 unknown_container` |
+| `seq_from` | 序号闭区间下界（含），必须 ≥ 1 |
+| `seq_to` | 序号闭区间上界（含），必须 ≥ 1；`seq_from > seq_to` 返回 `422 invalid_seq_range` |
+
+结果一律按 `seq` 升序返回；无命中时 `records` 为空数组（不是错误）。
+
+```bash
+# V1 参与过的全部批次
+curl 'http://localhost:8000/audit/records?container_id=V1'
+
+# 第 2~10 号记录
+curl 'http://localhost:8000/audit/records?seq_from=2&seq_to=10'
+
+# 组合：V1 在第 5 号之后的批次
+curl 'http://localhost:8000/audit/records?container_id=V1&seq_from=5'
+```
+
+```json
+{
+  "container_id": "V1",
+  "seq_from": 5,
+  "seq_to": null,
+  "count": 1,
+  "records": [ { "seq": 7, "...": "..." } ]
+}
+```
+
+#### 6.3 校验整条链
+
+```bash
+curl http://localhost:8000/audit/verify
+```
+
+服务在一致性只读快照内从 `seq=1` 顺序重放全链，逐条检查：
+
+1. 序号从 1 开始**连续无缺号**（检出删除中间记录）；
+2. 按 `payload` **重算 SHA-256** 与存储的 `record_hash` 一致（检出内容篡改）；
+3. `prev_hash` 等于上一条记录的 `record_hash`，首条为全 0 创世哈希
+   （检出断裂/重排，篡改者无法仅凭单条内容伪造链节）；
+4. 记录内 `affected_containers` 与 `versions` 的容器集合一致（摘要自洽）；
+5. `audit_containers` 索引行与记录中的受影响容器完全一致（索引未被篡改）。
+
+链完好时：
+
+```json
+{"valid": true, "count": 3, "head_seq": 1, "tail_seq": 3,
+ "tail_hash": "a1b2c3…", "break_at": null, "reason": null}
+```
+
+发现任何删改：`valid=false`，`break_at` 给出**首个**断裂记录的序号，`reason`
+为可读原因，例如：
+
+```json
+{"valid": false, "count": 3, "head_seq": 1, "tail_seq": 3, "tail_hash": null,
+ "break_at": 1, "reason": "记录内容与 record_hash 不符（记录被篡改或损坏）"}
+```
+
+空链（尚无成功批次）返回
+`{"valid": true, "count": 0, "head_seq": null, "tail_seq": null, "tail_hash": null, ...}`。
+`tail_hash` 可作为链头锚点对外公布，供外部比对链是否被续写。
+
 ---
 
 ## 精确性说明
@@ -385,11 +524,12 @@ pytest -q
 ```
 app/
   config.py     # 环境变量配置
-  db.py         # SQLite 连接、建库（启动时执行）
+  db.py         # SQLite 连接、建库与只追加触发器（启动时执行）
   schemas.py    # Pydantic 请求/响应模型（Decimal <-> 字符串）
   service.py    # 核心逻辑：登记、批量转移事务、比例分摊、查询
+  audit.py      # 只追加批次审计哈希链：写入、查询、整链校验
   main.py       # FastAPI 路由与错误处理
-tests/          # pytest 端到端与分摊算法测试
+tests/          # pytest 端到端、分摊算法与审计链测试（含篡改检出）
 Dockerfile
 docker-compose.yml
 docker-entrypoint.sh
